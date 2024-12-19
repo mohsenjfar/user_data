@@ -1,33 +1,18 @@
-version: '2'
-
-volumes:
-  nextcloud:
-  db:
-
+---
+version: '3'
 services:
-  db:
-    image: mariadb:10.6
-    restart: always
-    command: --transaction-isolation=READ-COMMITTED --log-bin=binlog --binlog-format=ROW
-    volumes:
-      - db:/var/lib/mysql
-    environment:
-      - MYSQL_ROOT_PASSWORD=
-      - MYSQL_PASSWORD=
-      - MYSQL_DATABASE=nextcloud
-      - MYSQL_USER=nextcloud
-
-  app:
-    image: nextcloud
-    restart: always
-    ports:
-      - 8080:80
-    links:
-      - db
-    volumes:
-      - nextcloud:/var/www/html
-    environment:
-      - MYSQL_PASSWORD=
-      - MYSQL_DATABASE=nextcloud
-      - MYSQL_USER=nextcloud
-      - MYSQL_HOST=db
+  freqtrade:
+      image: freqtradeorg/freqtrade:develop_freqai
+      restart: unless-stopped
+      container_name: strategy
+      ports:
+        - "127.0.0.1:8080:8080"
+      volumes:
+        - "./user_data:/freqtrade/user_data"
+      command: >
+        trade
+        --logfile /freqtrade/user_data/logs/strategy.log
+        --db-url sqlite:////freqtrade/user_data/db_strategy.sqlite
+        --config /freqtrade/user_data/config_strategy.json
+        --strategy Strategy
+  
