@@ -13,6 +13,7 @@ from scipy.signal import argrelextrema
 from freqtrade.strategy import (
     IStrategy,
     stoploss_from_open,
+    stoploss_from_absolute,
     timeframe_to_prev_date
 )
 import logging
@@ -28,17 +29,17 @@ class Strategy(IStrategy):
 
     stoploss = -0.01
 
-    timeframe = '15m'
+    timeframe = '1m'
 
     use_exit_signal = True
 
     use_custom_stoploss = True
 
-    startup_candle_count: int = 288
+    startup_candle_count: int = 48
 
     process_only_new_candles = True
 
-    rsi_kernel = 4
+    kernel = 1
 
     order_types = {
         'entry': 'limit',
@@ -52,7 +53,6 @@ class Strategy(IStrategy):
         'exit': 'GTC'
     }
 
-    custom_info = {}
 
     def ob_dataframe(self, pair):
         ob = self.dp.orderbook(pair, maximum=200)
@@ -69,37 +69,24 @@ class Strategy(IStrategy):
         bid_dataframe = pd.DataFrame(bid_values)
         ask_dataframe = pd.DataFrame(ask_values)
         return pd.concat((bid_dataframe,ask_dataframe))
+    
 
-
-    def correlated_pairs(self):
+    def informative_pairs(self):
         pairs = self.dp.current_whitelist()
-        tickers = {p:self.dp.get_pair_dataframe(pair=p, timeframe=self.timeframe).close for p in pairs}
-        dataframe = pd.DataFrame(tickers).ffill()
-        corr_df = dataframe.corr()
-        max_corrs = corr_df[(corr_df != 1)].max()
-        return corr_df[max_corrs == max_corrs.max()].index.to_list()
+        return [(pair, '1w') for pair in pairs]
 
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
 
-        dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
-        dataframe['tema'] = ta.TEMA(dataframe, timeperiod=9)
-
-        min_peaks = argrelextrema(dataframe["rsi"].values, np.less_equal, order=self.rsi_kernel)
-        max_peaks = argrelextrema(dataframe["rsi"].values, np.greater_equal, order=self.rsi_kernel)
-
-        dataframe['rsi_second_last_max'] = dataframe.at[max_peaks[0][-2], "rsi"]
-        dataframe['rsi_last_max'] = dataframe.at[max_peaks[0][-1], "rsi"]
-        dataframe['rsi_second_last_min'] = dataframe.at[min_peaks[0][-2], "rsi"]
-        dataframe['rsi_last_min'] = dataframe.at[min_peaks[0][-1], "rsi"]
-
-        dataframe['price_second_last_max'] = dataframe.at[max_peaks[0][-2], "high"]
-        dataframe['price_last_max'] = dataframe.at[max_peaks[0][-1], "high"]
-        dataframe['price_second_last_min'] = dataframe.at[min_peaks[0][-2], "low"]
-        dataframe['price_last_min'] = dataframe.at[min_peaks[0][-1], "low"]
-
-        dataframe['long_risk'] = abs(1 - dataframe['close'] / dataframe['price_second_last_min'])
-        dataframe['short_risk'] = abs(1 - dataframe['close'] / dataframe['price_second_last_max'])
+        informative = self.dp.get_pair_dataframe(pair=metadata['pair'], timeframe='1w')
+        min_peaks = argrelextrema(informative["low"].values, np.less_equal, order=self.kernel)
+        max_peaks = argrelextrema(informative["high"].values, np.greater_equal, order=self.kernel)
+        informative.loc[(informative.index.isin(min_peaks[0])),'extrema'] = informative.low
+        informative.loc[(informative.index.isin(max_peaks[0])),'extrema'] = informative.high
+        dataframe['last_peak'] = informative.extrema.dropna().iloc[-1]
+        dataframe['last_peak_diff'] = informative.extrema.dropna().pct_change().iloc[-1]
+        bins = informative.extrema.dropna().sort_values().values
+        dataframe['boundries'] = pd.cut(dataframe.close, bins=bins)
 
         return dataframe
 
@@ -108,22 +95,16 @@ class Strategy(IStrategy):
 
         dataframe.loc[
             (
-                (dataframe['price_second_last_min'] < dataframe['price_last_min']) & # Guard
-                (dataframe['rsi_second_last_min'] < dataframe['rsi_last_min']) & # Guard
-                (dataframe['rsi_second_last_min'] < 50) & # Guard
-                (dataframe['rsi_last_min'] < 50) & # Guard
-                (qtpylib.crossed_above(dataframe['close'], dataframe['tema'])) # Trigger
+                (dataframe['last_peak_diff'] < 0) &
+                (dataframe['close'] > dataframe['last_peak'])
             ),
             'enter_long'
         ] = 1
 
         dataframe.loc[
             (
-                (dataframe['price_second_last_max'] > dataframe['price_last_max']) & # Guard
-                (dataframe['rsi_second_last_max'] > dataframe['rsi_last_max']) & # Guard
-                (dataframe['rsi_second_last_max'] > 50) & # Guard
-                (dataframe['rsi_last_max'] > 50) & # Guard
-                (qtpylib.crossed_below(dataframe['close'], dataframe['tema'])) # Trigger
+                (dataframe['last_peak_diff'] > 0) &
+                (dataframe['close'] < dataframe['last_peak'])
             ),
             'enter_short'
         ] = 1
@@ -140,10 +121,16 @@ class Strategy(IStrategy):
                             proposed_stake: float, min_stake: Optional[float], max_stake: float,
                             leverage: float, entry_tag: Optional[str], side: str,
                             **kwargs) -> float:
+
+        candle_open_date = timeframe_to_prev_date(self.timeframe, current_time)
+        if candle_open_date + timedelta(seconds=5) < current_time:
+            return None
+        
         try:
             dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-            candle = dataframe.iloc[-1].squeeze()
-            risk = candle['short_risk'] if side == 'short' else candle['long_risk']
+            last_candle = dataframe.iloc[-1].squeeze()
+            limit = last_candle.boundries.right if side == 'short' else last_candle.boundries.left
+            risk = abs(1 - last_candle.close / limit)
             today = datetime.now(timezone.utc).date()
             closed_trades = Trade.get_trades_proxy(close_date=today)
             today_loss = sum(trade.close_profit_abs for trade in closed_trades if trade.close_profit_abs < 0)
@@ -154,17 +141,8 @@ class Strategy(IStrategy):
             if today_loss_ratio < self.stoploss:
                 logger.info(f"Max day loss ({today_loss_ratio * 100:.2f}%), stop entering {side} position for {pair}")
                 return None
-
-            lines = (
-                f"Pair: {pair}",
-                f"Side: {side}",
-                f"Risk: {risk * 100:.2f}%",
-                f"Proposed stake: {proposed_stake:.2f}$",
-                f"Stake: {(proposed_stake * abs(self.stoploss)) / (risk * leverage):.2f}$"
-            )
-            self.dp.send_msg("\n".join(lines))
             
-            return min((proposed_stake * abs(self.stoploss)) / (risk * leverage), proposed_stake)
+            return min((proposed_stake * (abs(self.stoploss)) / 2) / (risk * leverage), proposed_stake)
         
         except Exception as e:
             logger.info(e)
@@ -177,29 +155,11 @@ class Strategy(IStrategy):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
         return dataframe["close"].iat[-1]
 
-    
-    def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
-                            time_in_force: str, current_time: datetime, entry_tag: Optional[str],
-                            side: str, **kwargs) -> bool:
-        
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-        current_candle = dataframe.iloc[-1].squeeze()
-        risk = current_candle.short_risk if side == 'short' else current_candle.long_risk
-        if risk > 0.02:
-            logger.info(f"High risk stop entering {side} position for {pair}")
-            return False
-        
-        return True
-
 
     def order_filled(self, pair: str, trade: Trade, order, current_time: datetime, **kwargs) -> None:
 
         if (trade.nr_of_successful_entries == 1) and (order.ft_order_side == trade.entry_side):
-            dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-            current_candle = dataframe.iloc[-1].squeeze()
-            risk = current_candle.short_risk if trade.is_short else current_candle.long_risk
-            trade.set_custom_data(key='risk', value=risk)
-            trade.set_custom_data(key='OB', value=self.dp.orderbook(pair=pair, maximum=200))
+            trade.set_custom_data(key='OB', value=self.ob_dataframe(pair).to_dict())
 
         return None
     
@@ -208,20 +168,13 @@ class Strategy(IStrategy):
                         current_rate: float, current_profit: float, after_fill: bool, 
                         **kwargs) -> Optional[float]:
 
-        risk = trade.get_custom_data(key='risk')
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+        last_candle = dataframe.iloc[-1].squeeze()
+        limit = last_candle.boundries.right if trade.is_short else last_candle.boundries.left
 
-        if current_profit > 3 * risk:
-            return stoploss_from_open(
-                risk * (abs(current_profit) // risk - 1),
-                current_profit, 
-                is_short=trade.is_short, 
-                leverage=trade.leverage
-            )
-        
-        if abs(current_profit) < risk:
-            return stoploss_from_open(
-                risk * (abs(current_profit) // risk - 1),
-                current_profit, 
-                is_short=trade.is_short, 
+        return stoploss_from_absolute(
+                limit,
+                current_rate,
+                is_short=trade.is_short,
                 leverage=trade.leverage
             )
